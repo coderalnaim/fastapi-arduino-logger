@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>IoT Logger Control</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px;
+    }
+    h1 { margin-bottom: 10px; }
+    .card {
+      background: #111827;
+      border-radius: 14px;
+      padding: 24px 28px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+      max-width: 480px;
+      width: 100%;
+    }
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+      margin-right: 10px;
+    }
+    #startBtn { background: #22c55e; color: #022c22; }
+    #stopBtn { background: #ef4444; color: #fef2f2; }
+    #stopBtn:disabled, #startBtn:disabled {
+      opacity: 0.5; cursor: not-allowed;
+    }
+    .status {
+      margin-top: 16px;
+      font-size: 14px;
+      color: #9ca3af;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      margin-left: 8px;
+    }
+    .badge.running { background: #022c22; color: #4ade80; }
+    .badge.idle { background: #3f3f46; color: #e4e4e7; }
+    a.download-link {
+      color: #38bdf8;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <h1>IoT Logger</h1>
+  <div class="card">
+    <p>Control logging for all connected Arduino sensors. When you click <b>Start</b>, the server records the exact UTC time and devices will use it as their experiment start time.</p>
+
+    <div style="margin-top: 16px;">
+      <button id="startBtn">Start Logging</button>
+      <button id="stopBtn" disabled>Stop & Download ZIP</button>
+    </div>
+
+    <div class="status">
+      Status:
+      <span id="statusLabel">Idle</span>
+      <span id="statusBadge" class="badge idle">IDLE</span>
+      <div id="sessionInfo"></div>
+      <div id="message"></div>
+    </div>
+  </div>
+
+  <script>
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const statusLabel = document.getElementById("statusLabel");
+    const statusBadge = document.getElementById("statusBadge");
+    const sessionInfo = document.getElementById("sessionInfo");
+    const message = document.getElementById("message");
+
+    function setRunning(sessionId, startEpoch, startTimeUtc) {
+      statusLabel.textContent = "Logging...";
+      statusBadge.textContent = "RUNNING";
+      statusBadge.classList.remove("idle");
+      statusBadge.classList.add("running");
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      sessionInfo.innerHTML = `
+        Session: <b>${sessionId}</b><br>
+        start_epoch: <code>${startEpoch}</code><br>
+        start_time_utc: <code>${startTimeUtc}</code>
+      `;
+      message.textContent = "";
+    }
+
+    function setIdle() {
+      statusLabel.textContent = "Idle";
+      statusBadge.textContent = "IDLE";
+      statusBadge.classList.remove("running");
+      statusBadge.classList.add("idle");
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      sessionInfo.innerHTML = "";
+    }
+
+    startBtn.addEventListener("click", async () => {
+      message.textContent = "Starting...";
+      try {
+        const res = await fetch("/api/start", { method: "POST" });
+        const data = await res.json();
+        if (data.status === "started" || data.status === "already_running") {
+          setRunning(data.session_id, data.start_epoch, data.start_time_utc || "");
+        } else {
+          message.textContent = "Unexpected response from server.";
+        }
+      } catch (e) {
+        console.error(e);
+        message.textContent = "Failed to start logging.";
+      }
+    });
+
+    stopBtn.addEventListener("click", async () => {
+      message.textContent = "Stopping and preparing ZIP...";
+      try {
+        const res = await fetch("/api/stop", { method: "POST" });
+        if (!res.ok) {
+          message.textContent = "Failed to stop / download ZIP.";
+          return;
+        }
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "session_logs.zip";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+        setIdle();
+        message.textContent = "ZIP downloaded.";
+      } catch (e) {
+        console.error(e);
+        message.textContent = "Error while stopping.";
+      }
+    });
+  </script>
+</body>
+</html>
