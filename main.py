@@ -1,152 +1,250 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>IoT Logger Control</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f172a;
-      color: #e5e7eb;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 40px;
-    }
-    h1 { margin-bottom: 10px; }
-    .card {
-      background: #111827;
-      border-radius: 14px;
-      padding: 24px 28px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
-      max-width: 480px;
-      width: 100%;
-    }
-    button {
-      border: none;
-      border-radius: 999px;
-      padding: 10px 20px;
-      font-size: 16px;
-      cursor: pointer;
-      margin-right: 10px;
-    }
-    #startBtn { background: #22c55e; color: #022c22; }
-    #stopBtn { background: #ef4444; color: #fef2f2; }
-    #stopBtn:disabled, #startBtn:disabled {
-      opacity: 0.5; cursor: not-allowed;
-    }
-    .status {
-      margin-top: 16px;
-      font-size: 14px;
-      color: #9ca3af;
-    }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 12px;
-      margin-left: 8px;
-    }
-    .badge.running { background: #022c22; color: #4ade80; }
-    .badge.idle { background: #3f3f46; color: #e4e4e7; }
-    a.download-link {
-      color: #38bdf8;
-      text-decoration: none;
-    }
-  </style>
-</head>
-<body>
-  <h1>IoT Logger</h1>
-  <div class="card">
-    <p>Control logging for all connected Arduino sensors. When you click <b>Start</b>, the server records the exact UTC time and devices will use it as their experiment start time.</p>
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+import csv
+import io
+import json
+import shutil
 
-    <div style="margin-top: 16px;">
-      <button id="startBtn">Start Logging</button>
-      <button id="stopBtn" disabled>Stop & Download ZIP</button>
-    </div>
+app = FastAPI()
 
-    <div class="status">
-      Status:
-      <span id="statusLabel">Idle</span>
-      <span id="statusBadge" class="badge idle">IDLE</span>
-      <div id="sessionInfo"></div>
-      <div id="message"></div>
-    </div>
-  </div>
+# ---- State ----
+BASE_DIR = Path(__file__).parent
+SESSIONS_DIR = BASE_DIR / "sessions"
+SESSIONS_DIR.mkdir(exist_ok=True)
 
-  <script>
-    const startBtn = document.getElementById("startBtn");
-    const stopBtn = document.getElementById("stopBtn");
-    const statusLabel = document.getElementById("statusLabel");
-    const statusBadge = document.getElementById("statusBadge");
-    const sessionInfo = document.getElementById("sessionInfo");
-    const message = document.getElementById("message");
+logging_enabled: bool = False
+start_epoch: Optional[int] = None
+current_session_id: Optional[str] = None
+current_session_dir: Optional[Path] = None
 
-    function setRunning(sessionId, startEpoch, startTimeUtc) {
-      statusLabel.textContent = "Logging...";
-      statusBadge.textContent = "RUNNING";
-      statusBadge.classList.remove("idle");
-      statusBadge.classList.add("running");
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
-      sessionInfo.innerHTML = `
-        Session: <b>${sessionId}</b><br>
-        start_epoch: <code>${startEpoch}</code><br>
-        start_time_utc: <code>${startTimeUtc}</code>
-      `;
-      message.textContent = "";
+# For each device_id -> { "path": Path, "fields": [field1, field2, ...], "initialized": bool }
+device_logs: Dict[str, Dict[str, Any]] = {}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def new_session_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def init_device_csv(device_id: str, sample_fields: List[str]):
+    """
+    Initialize CSV for a device in current session, with header:
+    server_time_utc,device_id,<sample_fields...>
+    """
+    global device_logs, current_session_dir
+    if current_session_dir is None:
+        raise RuntimeError("No active session directory")
+
+    csv_path = current_session_dir / f"{device_id}.csv"
+    header = ["server_time_utc", "device_id"] + sample_fields
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+    device_logs[device_id] = {
+        "path": csv_path,
+        "fields": sample_fields,
+        "initialized": True
     }
 
-    function setIdle() {
-      statusLabel.textContent = "Idle";
-      statusBadge.textContent = "IDLE";
-      statusBadge.classList.remove("running");
-      statusBadge.classList.add("idle");
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-      sessionInfo.innerHTML = "";
+
+def append_device_rows(device_id: str, rows: List[Dict[str, Any]]):
+    """
+    Append rows to device CSV. rows are dicts with keys matching device_logs[device_id]['fields'].
+    """
+    meta = device_logs.get(device_id)
+    if meta is None or not meta["initialized"]:
+        raise RuntimeError(f"Device {device_id} not initialized")
+
+    csv_path = meta["path"]
+    fields = meta["fields"]
+
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for row in rows:
+            out = [utc_now_iso(), device_id]
+            for key in fields:
+                out.append(row.get(key, ""))
+            writer.writerow(out)
+
+
+@app.get("/")
+async def root():
+    # Simple pointer to dashboard (if served separately) or a tiny info page
+    html = """
+    <html>
+      <head><title>IoT Logger API</title></head>
+      <body>
+        <h1>IoT Logger API</h1>
+        <p>Use /dashboard for Start/Stop UI, or POST /api/start and /api/stop.</p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """
+    Simple HTML UI with Start/Stop buttons.
+    """
+    html = (BASE_DIR / "dashboard.html").read_text(encoding="utf-8")
+    return HTMLResponse(html)
+
+
+@app.post("/api/start")
+async def api_start():
+    """
+    Called by the web UI when user clicks START.
+    Creates a new session, sets logging_enabled = True, and start_epoch = now().
+    """
+    global logging_enabled, start_epoch, current_session_id, current_session_dir, device_logs
+
+    if logging_enabled:
+        # Already logging, just return current status
+        return {"status": "already_running", "start_epoch": start_epoch, "session_id": current_session_id}
+
+    logging_enabled = True
+    dt_now = datetime.now(timezone.utc)
+    start_epoch = int(dt_now.timestamp())
+    current_session_id = new_session_id()
+    current_session_dir = SESSIONS_DIR / current_session_id
+    current_session_dir.mkdir(exist_ok=True)
+    device_logs = {}
+
+    return {
+        "status": "started",
+        "start_epoch": start_epoch,
+        "session_id": current_session_id,
+        "start_time_utc": dt_now.isoformat().replace("+00:00", "Z"),
     }
 
-    startBtn.addEventListener("click", async () => {
-      message.textContent = "Starting...";
-      try {
-        const res = await fetch("/api/start", { method: "POST" });
-        const data = await res.json();
-        if (data.status === "started" || data.status === "already_running") {
-          setRunning(data.session_id, data.start_epoch, data.start_time_utc || "");
-        } else {
-          message.textContent = "Unexpected response from server.";
-        }
-      } catch (e) {
-        console.error(e);
-        message.textContent = "Failed to start logging.";
-      }
-    });
 
-    stopBtn.addEventListener("click", async () => {
-      message.textContent = "Stopping and preparing ZIP...";
-      try {
-        const res = await fetch("/api/stop", { method: "POST" });
-        if (!res.ok) {
-          message.textContent = "Failed to stop / download ZIP.";
-          return;
-        }
-        const blob = await res.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "session_logs.zip";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        window.URL.revokeObjectURL(url);
-        setIdle();
-        message.textContent = "ZIP downloaded.";
-      } catch (e) {
-        console.error(e);
-        message.textContent = "Error while stopping.";
-      }
-    });
-  </script>
-</body>
-</html>
+@app.post("/api/stop")
+async def api_stop():
+    """
+    Called by the web UI when user clicks STOP.
+    Disables logging and returns a ZIP of all CSV files from this session.
+    """
+    global logging_enabled, start_epoch, current_session_id, current_session_dir, device_logs
+
+    if not current_session_id or current_session_dir is None:
+        raise HTTPException(status_code=400, detail="No active session to stop")
+
+    logging_enabled = False
+
+    # Zip all CSVs in current session dir
+    mem_zip = io.BytesIO()
+    with shutil.make_archive(base_name=None, format="zip", root_dir=current_session_dir, base_dir=".") as _:
+        pass  # can't use shutil.make_archive directly to memory, so we do manual zip
+
+    # Manual zip creation instead of shutil.make_archive to memory:
+    import zipfile
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in current_session_dir.glob("*.csv"):
+            zf.write(p, arcname=p.name)
+    mem_zip.seek(0)
+
+    filename = f"session_{current_session_id}.zip"
+
+    # Reset session references (but keep files on disk)
+    logging_enabled = False
+    start_epoch = None
+    device_logs = {}
+
+    return StreamingResponse(
+        mem_zip,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/api/config")
+async def api_config(device_id: str):
+    """
+    Polled by Arduino.
+    Returns whether logging is enabled, and the start_epoch if available.
+    """
+    return {
+        "logging": logging_enabled,
+        "start_epoch": start_epoch
+    }
+
+
+@app.post("/api/bulk_samples")
+async def api_bulk_samples(request: Request):
+    """
+    Arduino sends chunks:
+    {
+      "device_id": "tof_01",
+      "samples": [
+        {
+          "timestamp_utc": "...",
+          "sensor_time_ms": ...,
+          "distance_m": ...,
+          "status": ...,
+          "signal": ...,
+          "precision_cm": ...
+        },
+        ...
+      ]
+    }
+
+    If logging_enabled is False, data is ignored (but returns 200).
+    """
+    if current_session_dir is None:
+        # No session started yet, ignore
+        return JSONResponse({"status": "ignored", "reason": "no_active_session"}, status_code=200)
+
+    body = await request.body()
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    device_id = data.get("device_id")
+    samples = data.get("samples")
+
+    if not isinstance(device_id, str) or not isinstance(samples, list):
+        raise HTTPException(status_code=400, detail="device_id (str) and samples (list) required")
+
+    if not logging_enabled:
+        # Currently not logging, just ignore the payload but respond OK
+        return {"status": "ignored", "reason": "logging_disabled"}
+
+    if len(samples) == 0:
+        return {"status": "ok", "written_rows": 0}
+
+    # Determine fields from first sample
+    first_sample = samples[0]
+    if not isinstance(first_sample, dict):
+        raise HTTPException(status_code=400, detail="samples must contain objects")
+
+    # Sorted keys for consistent CSV header
+    sample_fields = sorted(first_sample.keys())
+
+    # Init CSV for device if needed
+    if device_id not in device_logs or not device_logs[device_id]["initialized"]:
+        init_device_csv(device_id, sample_fields)
+    else:
+        # Ensure field set is same; if not, you might want to handle it more gracefully
+        existing_fields = device_logs[device_id]["fields"]
+        if existing_fields != sample_fields:
+            # For simplicity, we enforce same schema per device in one session
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field mismatch for device {device_id}. Expected {existing_fields}, got {sample_fields}"
+            )
+
+    # Append rows
+    append_device_rows(device_id, samples)
+
+    return {"status": "ok", "written_rows": len(samples)}
