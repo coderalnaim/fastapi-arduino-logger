@@ -6,9 +6,8 @@ from typing import Dict, List, Optional
 import csv
 import io
 import zipfile
-import re
 
-app = FastAPI(title="Universal Sensor Logging API")
+app = FastAPI(title="Bulk Sensor Logger (2-minute chunks)")
 
 # Directory for temporary CSVs
 LOG_DIR = Path("session_logs")
@@ -17,174 +16,184 @@ LOG_DIR.mkdir(exist_ok=True)
 # Global session state
 logging_enabled: bool = False
 session_id: Optional[str] = None
-device_files: Dict[str, Path] = {}      # device_id -> csv path
+device_files: Dict[str, Path] = {}       # device_id -> csv path
 device_headers: Dict[str, List[str]] = {}  # device_id -> header list
-
-# Very simple ISO8601-with-Z check
-ISO_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
 
 
 def start_session():
-  global logging_enabled, session_id, device_files, device_headers
-  logging_enabled = True
-  session_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-  device_files = {}
-  device_headers = {}
+    """Start a new global logging session."""
+    global logging_enabled, session_id, device_files, device_headers
+
+    logging_enabled = True
+    session_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    device_files = {}
+    device_headers = {}
 
 
 def stop_session_and_zip() -> bytes:
-  """
-  Stop logging, build a ZIP of all device CSVs, delete them, and return ZIP bytes.
-  """
-  global logging_enabled, session_id, device_files, device_headers
-  logging_enabled = False
+    """
+    Stop logging, bundle all device CSVs into an in-memory ZIP,
+    delete the CSVs on disk, and return the ZIP bytes.
+    """
+    global logging_enabled, session_id, device_files, device_headers
 
-  buf = io.BytesIO()
-  with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-    for dev_id, path in device_files.items():
-      if path.exists():
-        zf.write(path, arcname=path.name)
+    logging_enabled = False
 
-  buf.seek(0)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for dev_id, path in device_files.items():
+            if path.exists():
+                zf.write(path, arcname=path.name)
 
-  # Cleanup local CSV files
-  for path in device_files.values():
-    try:
-      if path.exists():
-        path.unlink()
-    except Exception:
-      pass
+    buf.seek(0)
 
-  device_files = {}
-  device_headers = {}
-  session_id = None
+    # Clean up files on disk
+    for path in device_files.values():
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
 
-  return buf.getvalue()
+    device_files = {}
+    device_headers = {}
+    session_id = None
+
+    return buf.getvalue()
 
 
 @app.get("/")
 def root():
-  return {
-    "message": "Universal Sensor Logging API",
-    "description": "Click /dashboard to start/stop a global logging session.",
-    "endpoints": {
-      "GET  /dashboard": "Start/Stop buttons + live status",
-      "POST /api/start": "Start global logging session",
-      "POST /api/stop": "Stop logging and download ZIP of CSVs",
-      "POST /api/measurement": "Devices send JSON here (10 Hz ok)",
-      "GET  /api/status": "Current logging state and known devices",
-    },
-  }
+    return {
+        "message": "Bulk Sensor Logger (2-minute chunks)",
+        "description": "Click /dashboard to control logging and download CSV ZIP.",
+        "endpoints": {
+            "GET  /dashboard": "Start / Stop & download buttons",
+            "POST /api/start": "Start global logging session",
+            "POST /api/stop": "Stop logging & download ZIP",
+            "POST /api/bulk_samples": "Arduino sends 2-minute JSON chunks here",
+            "GET  /api/status": "Current logging state and device files",
+        },
+    }
 
 
 @app.get("/api/status")
 def api_status():
-  return {
-    "logging_enabled": logging_enabled,
-    "session_id": session_id,
-    "devices": {
-      dev: {
-        "csv_file": str(path),
-        "header": device_headers.get(dev, []),
-      }
-      for dev, path in device_files.items()
-    },
-  }
+    return {
+        "logging_enabled": logging_enabled,
+        "session_id": session_id,
+        "devices": {
+            dev: {
+                "csv_file": str(path),
+                "header": device_headers.get(dev, []),
+            }
+            for dev, path in device_files.items()
+        },
+    }
 
 
 @app.post("/api/start")
 def api_start():
-  """
-  Start a new global logging session.
-  Existing temp files (if any) are forgotten and a new session_id is created.
-  """
-  if logging_enabled:
-    return {"logging_enabled": True, "session_id": session_id, "note": "already running"}
+    """
+    Start a new logging session. If already running, just return current state.
+    """
+    if logging_enabled:
+        return {"logging_enabled": True, "session_id": session_id, "note": "already running"}
 
-  start_session()
-  return {"logging_enabled": True, "session_id": session_id}
+    start_session()
+    return {"logging_enabled": True, "session_id": session_id}
 
 
 @app.post("/api/stop")
 def api_stop():
-  """
-  Stop logging, bundle all CSVs into a ZIP, delete them, and return ZIP for download.
-  """
-  if not logging_enabled and not device_files:
-    raise HTTPException(400, "No active session or files to download")
+    """
+    Stop logging, create a ZIP with all session CSVs, delete them on disk,
+    and return the ZIP to the client.
+    """
+    if not session_id:
+        raise HTTPException(400, "No active session")
 
-  zip_bytes = stop_session_and_zip()
-  filename = f"sensor_logs_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+    zip_bytes = stop_session_and_zip()
+    filename = f"sensor_logs_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
 
-  return StreamingResponse(
-    io.BytesIO(zip_bytes),
-    media_type="application/zip",
-    headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-  )
-
-
-@app.post("/api/measurement")
-def api_measurement(payload: dict = Body(...)):
-  """
-  Devices send JSON here (10 Hz).
-
-  Required fields in JSON:
-    - device_id (string)
-    - timestamp_utc (ISO8601, e.g. 2025-10-28T12:34:56.123Z)
-    - sensor_time_ms (int)
-
-  Any other keys are logged as additional columns.
-  """
-  # Basic required fields
-  if "device_id" not in payload:
-    raise HTTPException(400, "Missing 'device_id'")
-  if "timestamp_utc" not in payload:
-    raise HTTPException(400, "Missing 'timestamp_utc'")
-  if "sensor_time_ms" not in payload:
-    raise HTTPException(400, "Missing 'sensor_time_ms'")
-
-  device_id = str(payload["device_id"])
-  timestamp_utc = str(payload["timestamp_utc"])
-
-  # Optional validation of timestamp format
-  if not ISO_REGEX.match(timestamp_utc):
-    raise HTTPException(400, "timestamp_utc must be ISO8601 like 2025-10-28T12:34:56.123Z")
-
-  # If global logging is OFF, ignore
-  if not logging_enabled or session_id is None:
-    return {"stored": False, "reason": "logging_disabled"}
-
-  # Create CSV for this device if first time in this session
-  if device_id not in device_files:
-    csv_path = LOG_DIR / f"{session_id}_{device_id}.csv"
-    device_files[device_id] = csv_path
-
-    # Header: server_time_utc + all keys in payload (in current order)
-    header = ["server_time_utc"] + list(payload.keys())
-    device_headers[device_id] = header
-
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-      writer = csv.writer(f)
-      writer.writerow(header)
-
-  csv_path = device_files[device_id]
-  header = device_headers[device_id]
-
-  # Build row in same order as header
-  server_time = datetime.utcnow().isoformat() + "Z"
-  row = [server_time] + [payload.get(col, "") for col in header[1:]]
-
-  with csv_path.open("a", newline="", encoding="utf-8") as f:
-    writer = csv.writer(f)
-    writer.writerow(row)
-
-  return {"stored": True}
+    return StreamingResponse(
+        io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
-# ------------- Simple dashboard (Start / Stop buttons) -------------
+@app.post("/api/bulk_samples")
+def bulk_samples(payload: dict = Body(...)):
+    """
+    Arduino sends data every 2 minutes in a bulk JSON payload:
+
+    {
+      "device_id": "tof_01",
+      "samples": [
+        {
+          "timestamp_utc": "2025-11-19T18:02:57.842Z",
+          "sensor_time_ms": 2736032,
+          "distance_m": 0.046,
+          "status": 1,
+          "signal": 415,
+          "precision_cm": 2
+        },
+        ...
+      ]
+    }
+
+    If logging is enabled, all samples are appended to the device's CSV.
+    If logging is disabled, samples are ignored (but request still returns 200).
+    """
+
+    if "device_id" not in payload:
+        raise HTTPException(400, "Missing 'device_id'")
+    if "samples" not in payload or not isinstance(payload["samples"], list):
+        raise HTTPException(400, "Missing or invalid 'samples' (must be a list)")
+
+    dev_id = str(payload["device_id"])
+    samples = payload["samples"]
+
+    if not samples:
+        return {"stored": False, "reason": "empty_samples"}
+
+    # If global logging is OFF, ignore but don't error
+    if not logging_enabled or session_id is None:
+        return {"stored": False, "reason": "logging_disabled"}
+
+    # Create CSV for this device if first time in this session
+    if dev_id not in device_files:
+        csv_path = LOG_DIR / f"{session_id}_{dev_id}.csv"
+        device_files[dev_id] = csv_path
+
+        # Header uses keys from the FIRST sample
+        first_sample = samples[0]
+        header = ["server_time_utc"] + list(first_sample.keys())
+        device_headers[dev_id] = header
+
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
+    csv_path = device_files[dev_id]
+    header = device_headers[dev_id]
+
+    # Append all samples
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for s in samples:
+            server_time = datetime.utcnow().isoformat() + "Z"
+            row = [server_time] + [s.get(col, "") for col in header[1:]]
+            writer.writerow(row)
+
+    return {"stored": True, "device_id": dev_id, "samples_stored": len(samples)}
+
+
+# ------------ Simple HTML dashboard ------------
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-  html = """
+    html = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -199,8 +208,8 @@ def dashboard():
 <body>
   <h1>Sensor Logger Dashboard</h1>
   <p>
-    UNO / sensors always send data to <code>/api/measurement</code>.<br/>
-    The server only <strong>stores</strong> it between Start and Stop.
+    Arduino sends 10 Hz data in 2-minute bulk chunks to <code>/api/bulk_samples</code>.<br/>
+    The server only logs data between Start and Stop.
   </p>
 
   <button onclick="startSession()">▶ Start logging</button>
@@ -213,7 +222,7 @@ def dashboard():
 async function startSession() {
   const res = await fetch('/api/start', { method: 'POST' });
   const data = await res.json();
-  alert('Logging started, session: ' + data.session_id);
+  alert('Logging started. Session: ' + data.session_id);
   refreshStatus();
 }
 
@@ -247,4 +256,4 @@ refreshStatus();
 </body>
 </html>
 """
-  return HTMLResponse(content=html)
+    return HTMLResponse(content=html)
