@@ -39,7 +39,7 @@ The server provides a web dashboard to Start/Stop data recording sessions. When 
 To allow the Arduino to connect to your PC, you must run the server on `0.0.0.0` (listening on all network interfaces), not just localhost.
 
 ```bash
-uvicorn server:app --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Using the Dashboard
@@ -186,3 +186,4 @@ Your `loop()` should look like this to ensure stability:
 * **JSON Errors:** Ensure you aren't sending trailing commas in the JSON list.
 
 * **Memory Issues:** If the Arduino crashes, reduce `MAX_SAMPLES` or use `F()` macro for static strings if using AVR boards.
+
