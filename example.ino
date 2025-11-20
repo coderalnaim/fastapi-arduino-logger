@@ -5,7 +5,7 @@ char WIFI_SSID[] = "test";
 char WIFI_PASS[] = "12345678";
 
 // ---------- API ----------
-const char* API_HOST = "10.221.179.228";   // <-- your PC's LAN IP
+const char* API_HOST = "10.221.x.x";   // <-- your PC's LAN IP
 const int   API_PORT = 8000;
 const char* DEVICE_ID = "tof_01";
 
