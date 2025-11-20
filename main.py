@@ -15,9 +15,9 @@ SESSIONS_DIR = BASE_DIR / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
 # ---------- Global state ----------
-logging_enabled = False
-start_epoch = 0
-current_session_id = None
+logging_enabled: bool = False
+start_epoch: int = 0
+current_session_id: str | None = None
 current_session_dir: Path | None = None  # active session directory
 
 
@@ -33,8 +33,10 @@ def new_session_id() -> str:
 
 # ---------- CSV Helpers ----------
 def get_device_csv_path(device_id: str) -> Path:
+    global current_session_dir
     if current_session_dir is None:
-        return SESSIONS_DIR / f"orphan_{device_id}.csv" # Fallback (shouldn't happen with logic below)
+        # Fallback – shouldn't normally happen when session is running
+        return SESSIONS_DIR / f"orphan_{device_id}.csv"
     return current_session_dir / f"{device_id}.csv"
 
 
@@ -43,6 +45,7 @@ def ensure_device_csv(device_id: str, fieldnames: list[str]) -> None:
     if csv_path.exists():
         return
 
+    csv_path.parent.mkdir(exist_ok=True, parents=True)
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["server_time_utc", "device_id"] + fieldnames)
@@ -50,6 +53,7 @@ def ensure_device_csv(device_id: str, fieldnames: list[str]) -> None:
 
 def append_samples(device_id: str, samples: list[dict], fieldnames: list[str]) -> None:
     csv_path = get_device_csv_path(device_id)
+    csv_path.parent.mkdir(exist_ok=True, parents=True)
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         for s in samples:
@@ -92,14 +96,13 @@ async def dashboard():
 
         <script>
             async function updateStatus() {
-                // We can poll /api/config to see current server state
                 try {
                     let res = await fetch('/api/config?device_id=browser');
                     let data = await res.json();
                     let box = document.getElementById('statusBox');
                     if (data.logging) {
                         box.className = "status running";
-                        box.innerText = "Status: LOGGING (Started: " + data.start_epoch + ")";
+                        box.innerText = "Status: LOGGING (start_epoch: " + data.start_epoch + ")";
                     } else {
                         box.className = "status stopped";
                         box.innerText = "Status: STOPPED";
@@ -110,13 +113,13 @@ async def dashboard():
             async function startSession() {
                 let res = await fetch('/api/start', {method: 'POST'});
                 let data = await res.json();
-                document.getElementById('info').innerText = JSON.stringify(data);
+                document.getElementById('info').innerText = JSON.stringify(data, null, 2);
                 updateStatus();
             }
 
             async function stopSession() {
                 window.location.href = '/api/stop'; // Triggers download
-                setTimeout(updateStatus, 1000); // Update UI after download starts
+                setTimeout(updateStatus, 1000);
             }
 
             setInterval(updateStatus, 2000);
@@ -145,8 +148,8 @@ async def api_start():
     start_epoch = int(now.timestamp())
     current_session_id = new_session_id()
     current_session_dir = SESSIONS_DIR / current_session_id
-    current_session_dir.mkdir(exist_ok=True)
-    
+    current_session_dir.mkdir(exist_ok=True, parents=True)
+
     print(f"✅ Session STARTED: {current_session_id}")
 
     return {
@@ -158,7 +161,7 @@ async def api_start():
 
 
 # ---------------- STOP SESSION ----------------
-@app.get("/api/stop") # Changed to GET so browser can trigger download easily
+@app.get("/api/stop")
 async def api_stop():
     global logging_enabled, start_epoch, current_session_id, current_session_dir
 
@@ -168,12 +171,12 @@ async def api_stop():
     session_dir = current_session_dir
     session_id = current_session_id
 
-    # Reset state immediately so Arduino stops logging
+    # Reset state so Arduino stops logging
     logging_enabled = False
     start_epoch = 0
     current_session_id = None
     current_session_dir = None
-    
+
     print(f"🛑 Session STOPPED: {session_id}")
 
     # Build ZIP in memory
@@ -181,10 +184,10 @@ async def api_stop():
     with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         files = list(session_dir.glob("*.csv"))
         if not files:
-            # Add a dummy file if empty so zip is valid
             zf.writestr("empty.txt", "No data collected.")
-        for csv_file in files:
-            zf.write(csv_file, arcname=csv_file.name)
+        else:
+            for csv_file in files:
+                zf.write(csv_file, arcname=csv_file.name)
     mem.seek(0)
 
     return StreamingResponse(
@@ -211,39 +214,46 @@ async def api_config(device_id: str):
 # ---------------- BULK UPLOAD FROM ARDUINO ----------------
 @app.post("/api/bulk_samples")
 async def api_bulk_samples(request: Request):
-    global logging_enabled, current_session_dir
+    global logging_enabled, current_session_dir, current_session_id
 
-    # CRITICAL: Logic to tell Arduino to stop
-    if not logging_enabled or current_session_dir is None:
-        print("⚠️ Received data but logging is OFF. Telling Arduino to ignore.")
-        return {"status": "ignored", "reason": "not_logging"}
-
-    # Parse JSON
     body = await request.body()
+    print("📥 /api/bulk_samples called")
+    print(f"  logging_enabled={logging_enabled}, current_session_dir={current_session_dir}")
+    print(f"  body_len={len(body)}")
+
     try:
         data = json.loads(body)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON decode error: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     device_id = data.get("device_id")
     samples = data.get("samples")
 
     if not device_id or not isinstance(samples, list):
-         return {"status": "error", "reason": "invalid_format"}
+        print("❌ Invalid payload: missing device_id or samples")
+        return {"status": "error", "reason": "invalid_format"}
 
     if len(samples) == 0:
+        print(f"ℹ️ No samples in request for device {device_id}")
         return {"status": "ok", "written": 0}
 
-    # Determine fieldnames from first sample
+    # If for some reason the process restarted and lost session_dir,
+    # create a fallback "orphan" session so you never lose data.
+    if current_session_dir is None:
+        fallback_id = current_session_id or f"orphan_{new_session_id()}"
+        current_session_dir = SESSIONS_DIR / fallback_id
+        current_session_dir.mkdir(exist_ok=True, parents=True)
+        print(f"⚠️ No active session_dir, using fallback: {current_session_dir}")
+
     first = samples[0]
     fieldnames = sorted(first.keys())
 
-    # Create CSV if needed
-    ensure_device_csv(device_id, fieldnames)
+    print(f"  device_id={device_id}, sample_count={len(samples)}, fieldnames={fieldnames}")
 
-    # Append rows
+    ensure_device_csv(device_id, fieldnames)
     append_samples(device_id, samples, fieldnames)
-    
-    print(f"📝 Saved {len(samples)} samples from {device_id}")
+
+    print(f"📝 Saved {len(samples)} samples from {device_id} into {get_device_csv_path(device_id)}")
 
     return {"status": "ok", "written": len(samples)}
